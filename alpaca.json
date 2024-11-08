@@ -1,0 +1,40 @@
+{
+    "description": "Alpaca offers commission-free trading to buy and sell stocks, options, or crypto.",
+    "platforms-features": [
+        {
+            "Platforms": ["Cloud Platform", "Local Platform", "LEAN CLI"],
+			"Download Data": [0,0,0],
+			"Backtesting": [0,0,0],
+			"Optimization": [0,0,0],
+			"Live Trading":	[0,0,0]
+        }
+    ],
+    "order-types": ["Market", "Limit", "Stop Market", "Stop Limit", "Trailing", "Market On Open", "Market On Close"],
+	"assets": ["Equity", "Equity Options", "Crypto"], 
+	"brokerage-url": "https://alpaca.markets/",
+  	"documentation": "/docs/v2/cloud-platform/live-trading/brokerages/alpaca",
+	"module-specification": {
+		"download": {
+			"data-types": [
+				"Trade",
+				"Quote"
+			],
+			"resolutions": [
+                "Tick",
+				"Second",
+				"Minute",
+				"Hour",
+				"Daily"
+			],
+			"security-types": [
+				"Equity",
+				"Option",
+                		"Crypto"
+			],
+			"markets": [
+				"USA",
+                		"Coinbase"
+			]
+		}
+	}
+}

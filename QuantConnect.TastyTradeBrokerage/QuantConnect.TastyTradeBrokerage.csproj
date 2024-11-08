@@ -1,0 +1,52 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+	<PropertyGroup>
+		<NoWarn>$(NoWarn);NU1605</NoWarn>
+		<Configuration Condition=" '$(Configuration)' == '' ">Release</Configuration>
+		<Platform Condition=" '$(Platform)' == '' ">AnyCPU</Platform>
+		<TargetFramework>net6.0</TargetFramework>
+		<Product>QuantConnect.Brokerages.Alpaca</Product>
+		<AssemblyName>QuantConnect.Brokerages.TastyTrade</AssemblyName>
+		<RootNamespace>QuantConnect.Brokerages.TastyTrade</RootNamespace>
+		<AssemblyTitle>QuantConnect.Brokerages.Alpaca</AssemblyTitle>
+		<OutputType>Library</OutputType>
+		<OutputPath>bin\$(Configuration)\</OutputPath>
+		<AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+		<CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+		<GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+		<Description>QuantConnect LEAN Alpaca Brokerage: Brokerage plugin for Lean</Description>
+	</PropertyGroup>
+	<PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
+		<DebugType>full</DebugType>
+		<OutputPath>bin\Debug\</OutputPath>
+	</PropertyGroup>
+	<PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Release|AnyCPU' ">
+		<DebugType>pdbonly</DebugType>
+		<OutputPath>bin\Release\</OutputPath>
+	</PropertyGroup>
+	<ItemGroup>
+		<Compile Include="..\..\Lean\Common\Properties\SharedAssemblyInfo.cs" Link="Properties\SharedAssemblyInfo.cs" />
+	</ItemGroup>
+	<ItemGroup>
+		<PackageReference Include="Newtonsoft.Json" Version="13.0.2" />
+		<PackageReference Include="QuantConnect.Brokerages" Version="2.5.*" />
+		<PackageReference Include="Polly" Version="8.3.1" />
+		<PackageReference Include="MessagePack" Version="2.5.172" />
+		<!--Dependencies of Alpaca.Markets.dll-->
+		<PackageReference Include="System.Threading.Channels" Version="8.0.0" PrivateAssets="compile;contentfiles;build;analyzers" />
+		<PackageReference Include="System.IO.Pipelines" Version="8.0.0" PrivateAssets="compile;contentfiles;build;analyzers" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<Reference Include="Alpaca.Markets">
+			<HintPath>Alpaca.Markets.dll</HintPath>
+		</Reference>
+		<None Update="Alpaca.Markets.dll" Pack="True">
+			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+			<PackageCopyToOutput>true</PackageCopyToOutput>
+		</None>
+		<None Update="Alpaca.Markets.deps.json" Pack="True">
+			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+			<PackageCopyToOutput>true</PackageCopyToOutput>
+		</None>
+	</ItemGroup>
+</Project>

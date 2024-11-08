@@ -1,0 +1,12 @@
+{
+  "data-folder": "../../../../Lean/Data/",
+
+  "job-user-id": "0",
+  "api-access-token": "",
+  "job-organization-id": "",
+
+  "tastytrade-api-key": "",
+  "tastytrade-api-secret": "",
+  "tastytrade-access-token": "",
+  "tastytrade-paper-trading": true
+}
