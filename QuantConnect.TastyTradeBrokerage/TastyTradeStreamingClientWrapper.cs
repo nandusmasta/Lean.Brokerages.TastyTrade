@@ -18,6 +18,7 @@ namespace QuantConnect.Brokerages.TastyTrade
 
         private bool _connectionFailed;
         private bool _authenticatedStream;
+        private readonly SemaphoreSlim _connectionLock = new SemaphoreSlim(1, 1);
 
         public event Action<AuthStatus> Connected;
         public event Action SocketOpened;
@@ -42,57 +43,70 @@ namespace QuantConnect.Brokerages.TastyTrade
 
             try
             {
-                // Get streaming URL and token from API
-                var response = await _httpClient.GetAsync($"{_baseUrl}/api-quote-tokens");
-                var content = await response.Content.ReadAsStringAsync();
-                var data = JObject.Parse(content);
-
-                var wsUrl = data["websocket-url"].ToString();
-                var streamToken = data["token"].ToString();
-
-                var streamUrl = GetStreamingUrl(wsUrl, streamToken);
-                Log.Trace($"TastyTradeStreamingClientWrapper.ConnectAndAuthenticateAsync({_securityType}): Connecting to {streamUrl}");
-
-                // Create and connect WebSocket client
-                _streamingClient = new TastyTradeWebSocketClient(streamUrl, _sessionToken, _securityType);
-
-                _streamingClient.Connected += () =>
+                await _connectionLock.WaitAsync(cancellationToken);
+                if (_authenticatedStream)
                 {
-                    _authenticatedStream = true;
-                    SocketOpened?.Invoke();
-                    Connected?.Invoke(AuthStatus.Authorized);
-                };
-
-                _streamingClient.Disconnected += () =>
-                {
-                    _authenticatedStream = false;
-                    SocketClosed?.Invoke();
-                };
-
-                _streamingClient.Error += (ex) =>
-                {
-                    _connectionFailed = true;
-                    OnError?.Invoke(ex);
-                };
-
-                await _streamingClient.Connect();
-
-                if (_authenticatedStream && !_connectionFailed)
-                {
-                    result = AuthStatus.Authorized;
-                    Log.Trace($"TastyTradeStreamingClientWrapper.ConnectAndAuthenticateAsync({_securityType}): Successfully connected");
+                    return AuthStatus.Authorized;
                 }
-                else
+
+                try
                 {
-                    var message = $"{_securityType} failed to connect to streaming feed";
-                    EnvironmentFailure?.Invoke(message);
+                    // Get streaming URL and token from API
+                    var response = await _httpClient.GetAsync($"{_baseUrl}/api-quote-tokens");
+                    var content = await response.Content.ReadAsStringAsync();
+                    var data = JObject.Parse(content);
+
+                    var wsUrl = data["websocket-url"].ToString();
+                    var streamToken = data["token"].ToString();
+
+                    var streamUrl = GetStreamingUrl(wsUrl, streamToken);
+                    Log.Trace($"TastyTradeStreamingClientWrapper.ConnectAndAuthenticateAsync({_securityType}): Connecting to {streamUrl}");
+
+                    // Create and connect WebSocket client
+                    _streamingClient = new TastyTradeWebSocketClient(streamUrl, _sessionToken, _securityType);
+
+                    _streamingClient.Connected += () =>
+                    {
+                        _authenticatedStream = true;
+                        SocketOpened?.Invoke();
+                        Connected?.Invoke(AuthStatus.Authorized);
+                    };
+
+                    _streamingClient.Disconnected += () =>
+                    {
+                        _authenticatedStream = false;
+                        SocketClosed?.Invoke();
+                    };
+
+                    _streamingClient.Error += (ex) =>
+                    {
+                        _connectionFailed = true;
+                        OnError?.Invoke(ex);
+                    };
+
+                    await _streamingClient.Connect();
+
+                    if (_authenticatedStream && !_connectionFailed)
+                    {
+                        result = AuthStatus.Authorized;
+                        Log.Trace($"TastyTradeStreamingClientWrapper.ConnectAndAuthenticateAsync({_securityType}): Successfully connected");
+                    }
+                    else
+                    {
+                        var message = $"{_securityType} failed to connect to streaming feed";
+                        EnvironmentFailure?.Invoke(message);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log.Error($"TastyTradeStreamingClientWrapper.ConnectAndAuthenticateAsync({_securityType}): {ex.Message}");
+                    OnError?.Invoke(ex);
+                    _connectionFailed = true;
                 }
             }
-            catch (Exception ex)
+            finally
             {
-                Log.Error($"TastyTradeStreamingClientWrapper.ConnectAndAuthenticateAsync({_securityType}): {ex.Message}");
-                OnError?.Invoke(ex);
-                _connectionFailed = true;
+                _connectionLock.Release();
             }
 
             return result;
@@ -102,11 +116,20 @@ namespace QuantConnect.Brokerages.TastyTrade
         {
             try
             {
-                if (_streamingClient != null)
+                await _connectionLock.WaitAsync(cancellationToken);
+                try
                 {
-                    await _streamingClient.Disconnect();
-                    _streamingClient.Dispose();
-                    _streamingClient = null;
+                    if (_streamingClient != null)
+                    {
+                        await _streamingClient.Disconnect();
+                        _streamingClient.Dispose();
+                        _streamingClient = null;
+                        _authenticatedStream = false;
+                    }
+                }
+                finally
+                {
+                    _connectionLock.Release();
                 }
             }
             catch (Exception ex)
@@ -119,6 +142,7 @@ namespace QuantConnect.Brokerages.TastyTrade
         {
             _streamingClient?.Dispose();
             _httpClient?.Dispose();
+            _connectionLock?.Dispose();
         }
 
         private string GetStreamingUrl(string baseWsUrl, string streamToken)

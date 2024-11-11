@@ -17,6 +17,9 @@ using System.Threading.Tasks;
 using QuantConnect.Configuration;
 using System.Collections.Concurrent;
 using QLNet;
+using System.Net.WebSockets;
+using System.Threading;
+using QuantConnect.Data.Market;
 
 namespace QuantConnect.Brokerages.TastyTrade
 {
@@ -26,11 +29,13 @@ namespace QuantConnect.Brokerages.TastyTrade
         private IHttpClient _client;
         private TastyTradeSymbolMapper _symbolMapper;
         private string _sessionToken;
+        private string _accountId;
 
         private IDataAggregator _aggregator;
         private IOrderProvider _orderProvider;
         private ISecurityProvider _securityProvider;
-
+        
+        private readonly ConcurrentDictionary<string, TastyTradeWebSocketClient> _websocketClients = new();
         private EventBasedDataQueueHandlerSubscriptionManager _subscriptionManager;
         private ConcurrentDictionary<int, decimal> _orderIdToFillQuantity;
         private BrokerageConcurrentMessageHandler<ITastyTradeOrderUpdate> _messageHandler;
@@ -305,22 +310,171 @@ namespace QuantConnect.Brokerages.TastyTrade
         {
             if (_connected) return;
 
-            // Initialize WebSocket connections
-            // TODO: implement WebSocket connections
+            try
+            {
+                // Initialize account details first
+                _accountId = GetAccountId();
 
-            _connected = true;
+                // Initialize WebSocket connections
+                var quoteSocket = new TastyTradeWebSocketClient(GetQuoteStreamUrl(_accountId), _sessionToken, SecurityType.Equity);
+                var tradeSocket = new TastyTradeWebSocketClient(GetTradeStreamUrl(_accountId), _sessionToken, SecurityType.Equity);
+
+                // Set up message handlers
+                quoteSocket.MessageReceived += (msg) => HandleQuoteMessage(msg);
+                tradeSocket.MessageReceived += (msg) => HandleTradeMessage(msg);
+
+                // Set up error handlers
+                quoteSocket.Error += (ex) => OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Error, -1, $"Quote socket error: {ex.Message}"));
+                tradeSocket.Error += (ex) => OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Error, -1, $"Trade socket error: {ex.Message}"));
+
+                // Connect sockets
+                quoteSocket.Connect().Wait();
+                tradeSocket.Connect().Wait();
+
+                // Store socket clients
+                _websocketClients["quote"] = quoteSocket;
+                _websocketClients["trade"] = tradeSocket;
+
+                _connected = true;
+                OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Reconnect, -1, "Connected successfully to TastyTrade"));
+            }
+            catch (Exception e)
+            {
+                Log.Error($"TastyTradeBrokerage.Connect(): Error connecting: {e.Message}");
+                _connected = false;
+                OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Error, -1, $"Error connecting to TastyTrade: {e.Message}"));
+                throw;
+            }
         }
 
         public override void Disconnect()
         {
-            // Close WebSocket connections
-            // TODO: implement WebSocket disconnection
+            if (!_connected) return;
+
+            try
+            {
+                foreach (var client in _websocketClients.Values)
+                {
+                    try
+                    {
+                        client.Disconnect().Wait(TimeSpan.FromSeconds(2));
+                        client.Dispose();
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Error($"TastyTradeBrokerage.Disconnect(): Error disconnecting WebSocket client: {ex.Message}");
+                    }
+                }
+
+                _websocketClients.Clear();
+                _connected = false;
+                OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Disconnect, -1, "Disconnected from TastyTrade"));
+            }
+            catch (Exception e)
+            {
+                Log.Error($"TastyTradeBrokerage.Disconnect(): Error during disconnect: {e.Message}");
+                throw;
+            }
         }
 
         private string GetAccountId()
         {
-            // TODO: Implement account ID retrieval from TastyTrade API
-            throw new NotImplementedException();
+            if (!string.IsNullOrEmpty(_accountId))
+            {
+                return _accountId;
+            }
+
+            try
+            {
+                var response = _client.GetAsync($"{_baseUrl}/customers/me/accounts").Result;
+                var content = response.Content.ReadAsStringAsync().Result;
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    throw new BrokerageException($"Error getting account information: {content}");
+                }
+
+                var accounts = JObject.Parse(content);
+
+                // Get the first active trading account
+                var tradingAccount = accounts["data"]["items"]
+                    .FirstOrDefault(a => a["type"].ToString() == "trading" &&
+                                       a["status"].ToString() == "active");
+
+                if (tradingAccount == null)
+                {
+                    throw new BrokerageException("No active trading account found");
+                }
+
+                _accountId = tradingAccount["account-number"].ToString();
+
+                if (string.IsNullOrEmpty(_accountId))
+                {
+                    throw new BrokerageException("Account number not found in response");
+                }
+
+                return _accountId;
+            }
+            catch (Exception e)
+            {
+                var message = $"Error retrieving account ID: {e.Message}";
+                Log.Error($"TastyTradeBrokerage.GetAccountId(): {message}");
+                throw new BrokerageException(message, e);
+            }
+        }
+
+        private void HandleQuoteMessage(JObject message)
+        {
+            try
+            {
+                if (!_subscriptionsBySymbol.TryGetValue(message["symbol"].ToString(), out var subscription))
+                {
+                    return;
+                }
+
+                var tick = new Tick
+                {
+                    Symbol = subscription.Symbol,
+                    Time = DateTime.UtcNow.ConvertFromUtc(subscription.ExchangeTimeZone),
+                    TickType = TickType.Quote,
+                    BidPrice = message["bid"].Value<decimal>(),
+                    AskPrice = message["ask"].Value<decimal>(),
+                    BidSize = message["bidSize"].Value<decimal>(),
+                    AskSize = message["askSize"].Value<decimal>()
+                };
+
+                _aggregator.Update(tick);
+            }
+            catch (Exception e)
+            {
+                Log.Error($"TastyTradeBrokerage.HandleQuoteMessage(): Error processing quote message: {e.Message}");
+            }
+        }
+
+        private void HandleTradeMessage(JObject message)
+        {
+            try
+            {
+                if (!_subscriptionsBySymbol.TryGetValue(message["symbol"].ToString(), out var subscription))
+                {
+                    return;
+                }
+
+                var tick = new Tick
+                {
+                    Symbol = subscription.Symbol,
+                    Time = DateTime.UtcNow.ConvertFromUtc(subscription.ExchangeTimeZone),
+                    TickType = TickType.Trade,
+                    Value = message["price"].Value<decimal>(),
+                    Quantity = message["size"].Value<decimal>()
+                };
+
+                _aggregator.Update(tick);
+            }
+            catch (Exception e)
+            {
+                Log.Error($"TastyTradeBrokerage.HandleTradeMessage(): Error processing trade message: {e.Message}");
+            }
         }
 
         private HttpContent CreateOrderRequest(Order order)
@@ -424,9 +578,43 @@ namespace QuantConnect.Brokerages.TastyTrade
             // TODO: Implement order update handling
         }
 
+        // Improved cleanup in Dispose method
         public override void Dispose()
         {
-            _client.Dispose();
+            // Cancel any pending operations
+            _cancellationTokenSource?.Cancel();
+
+            // Cleanup WebSockets
+            foreach (var sockets in _webSocketsBySymbol.Values)
+            {
+                foreach (var socket in sockets)
+                {
+                    try
+                    {
+                        if (socket != null)
+                        {
+                            if (socket.State == WebSocketState.Open)
+                            {
+                                socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Disposing",
+                                    CancellationToken.None).Wait(TimeSpan.FromSeconds(1));
+                            }
+                            socket.Dispose();
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Error($"TastyTradeBrokerage.Dispose(): Error disposing WebSocket: {ex.Message}");
+                    }
+                }
+            }
+            _webSocketsBySymbol.Clear();
+
+            // Cleanup other resources
+            _client?.Dispose();
+            _aggregator?.Dispose();
+            _messageHandler = null; // Simply null out the message handler
+            _cancellationTokenSource?.Dispose();
+
             base.Dispose();
         }
 

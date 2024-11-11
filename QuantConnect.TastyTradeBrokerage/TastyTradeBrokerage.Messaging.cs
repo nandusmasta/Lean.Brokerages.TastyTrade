@@ -42,8 +42,8 @@ namespace QuantConnect.Brokerages.TastyTrade
                     var quoteSocket = new ClientWebSocket();
                     var tradeSocket = new ClientWebSocket();
 
-                    ConnectWebSocket(quoteSocket, GetQuoteStreamUrl(brokerageSymbol)).Wait();
-                    ConnectWebSocket(tradeSocket, GetTradeStreamUrl(brokerageSymbol)).Wait();
+                    ConnectWebSocketWithRetry(quoteSocket, GetQuoteStreamUrl(brokerageSymbol)).Wait();
+                    ConnectWebSocketWithRetry(tradeSocket, GetTradeStreamUrl(brokerageSymbol)).Wait();
 
                     _webSocketsBySymbol[symbol] = new[] { quoteSocket, tradeSocket };
 
@@ -107,6 +107,52 @@ namespace QuantConnect.Brokerages.TastyTrade
             var buffer = Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(auth));
             await webSocket.SendAsync(new ArraySegment<byte>(buffer), WebSocketMessageType.Text, true,
                 _cancellationTokenSource.Token);
+        }
+
+        // Improved implementation with retry logic and better error handling
+        private async Task ConnectWebSocketWithRetry(ClientWebSocket webSocket, string url, int maxRetries = 3)
+        {
+            int retryCount = 0;
+            bool connected = false;
+            Exception lastException = null;
+
+            while (!connected && retryCount < maxRetries)
+            {
+                try
+                {
+                    _cancellationTokenSource = new CancellationTokenSource();
+                    _cancellationTokenSource.CancelAfter(TimeSpan.FromSeconds(30)); // Add timeout
+
+                    await webSocket.ConnectAsync(new Uri(url), _cancellationTokenSource.Token);
+
+                    if (webSocket.State == WebSocketState.Open)
+                    {
+                        connected = true;
+                        Log.Trace($"TastyTradeBrokerage.ConnectWebSocket(): Successfully connected to {url}");
+                    }
+                    else
+                    {
+                        throw new BrokerageException($"WebSocket failed to connect. State: {webSocket.State}");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    lastException = ex;
+                    retryCount++;
+
+                    if (retryCount < maxRetries)
+                    {
+                        var delay = Math.Pow(2, retryCount); // Exponential backoff
+                        Log.Error($"TastyTradeBrokerage.ConnectWebSocket(): Attempt {retryCount} failed. Retrying in {delay} seconds. Error: {ex.Message}");
+                        await Task.Delay(TimeSpan.FromSeconds(delay));
+                    }
+                }
+            }
+
+            if (!connected)
+            {
+                throw new BrokerageException($"Failed to connect after {maxRetries} attempts", lastException);
+            }
         }
 
         private void StartWebSocketListening(ClientWebSocket socket, string symbol, Action<string, string> messageHandler)
