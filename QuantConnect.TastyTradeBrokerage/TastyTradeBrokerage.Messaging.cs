@@ -23,6 +23,8 @@ namespace QuantConnect.Brokerages.TastyTrade
         private readonly object _locker = new();
         private CancellationTokenSource _cancellationTokenSource;
 
+        #region Subscription Management
+
         private bool Subscribe(IEnumerable<Symbol> symbols)
         {
             lock (_locker)
@@ -87,6 +89,16 @@ namespace QuantConnect.Brokerages.TastyTrade
             return true;
         }
 
+        private class SubscriptionData
+        {
+            public Symbol Symbol { get; set; }
+            public DateTimeZone ExchangeTimeZone { get; set; }
+        }
+
+        #endregion
+
+        #region WebSocket Connection
+
         private async Task ConnectWebSocket(ClientWebSocket webSocket, string url)
         {
             _cancellationTokenSource = new CancellationTokenSource();
@@ -109,7 +121,6 @@ namespace QuantConnect.Brokerages.TastyTrade
                 _cancellationTokenSource.Token);
         }
 
-        // Improved implementation with retry logic and better error handling
         private async Task ConnectWebSocketWithRetry(ClientWebSocket webSocket, string url, int maxRetries = 3)
         {
             int retryCount = 0;
@@ -123,12 +134,24 @@ namespace QuantConnect.Brokerages.TastyTrade
                     _cancellationTokenSource = new CancellationTokenSource();
                     _cancellationTokenSource.CancelAfter(TimeSpan.FromSeconds(30)); // Add timeout
 
+                    Log.Trace($"TastyTradeBrokerage.ConnectWebSocket(): Attempting to connect to {url}");
                     await webSocket.ConnectAsync(new Uri(url), _cancellationTokenSource.Token);
 
                     if (webSocket.State == WebSocketState.Open)
                     {
+                        // Send authentication message
+                        var auth = new
+                        {
+                            authorization = _sessionToken,
+                            action = "auth"
+                        };
+
+                        var buffer = Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(auth));
+                        await webSocket.SendAsync(new ArraySegment<byte>(buffer), WebSocketMessageType.Text, true,
+                            _cancellationTokenSource.Token);
+
                         connected = true;
-                        Log.Trace($"TastyTradeBrokerage.ConnectWebSocket(): Successfully connected to {url}");
+                        Log.Trace($"TastyTradeBrokerage.ConnectWebSocket(): Successfully connected and authenticated to {url}");
                     }
                     else
                     {
@@ -158,21 +181,42 @@ namespace QuantConnect.Brokerages.TastyTrade
         private void StartWebSocketListening(ClientWebSocket socket, string symbol, Action<string, string> messageHandler)
         {
             var buffer = new byte[4096];
+            var messageBuilder = new StringBuilder();
+
             Task.Run(async () =>
             {
                 try
                 {
                     while (socket.State == WebSocketState.Open && !_cancellationTokenSource.Token.IsCancellationRequested)
                     {
-                        var result = await socket.ReceiveAsync(new ArraySegment<byte>(buffer), _cancellationTokenSource.Token);
-                        if (result.MessageType == WebSocketMessageType.Close)
+                        WebSocketReceiveResult result;
+                        do
                         {
-                            await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, string.Empty, CancellationToken.None);
-                            break;
-                        }
+                            result = await socket.ReceiveAsync(new ArraySegment<byte>(buffer), _cancellationTokenSource.Token);
+                            if (result.MessageType == WebSocketMessageType.Close)
+                            {
+                                await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, string.Empty, CancellationToken.None);
+                                break;
+                            }
 
-                        var message = Encoding.UTF8.GetString(buffer, 0, result.Count);
-                        messageHandler(symbol, message);
+                            messageBuilder.Append(Encoding.UTF8.GetString(buffer, 0, result.Count));
+                        }
+                        while (!result.EndOfMessage);
+
+                        if (result.MessageType != WebSocketMessageType.Close)
+                        {
+                            var message = messageBuilder.ToString();
+                            messageBuilder.Clear();
+
+                            try
+                            {
+                                messageHandler(symbol, message);
+                            }
+                            catch (Exception e)
+                            {
+                                Log.Error($"TastyTradeBrokerage.StartWebSocketListening(): Error processing message: {e.Message}");
+                            }
+                        }
                     }
                 }
                 catch (Exception e)
@@ -183,12 +227,16 @@ namespace QuantConnect.Brokerages.TastyTrade
                     if (IsConnected)
                     {
                         _connected = false;
-                        OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Disconnect,
-                            "WebSocket disconnected", "Connection lost"));
+                        OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Disconnect, -1,
+                            $"WebSocket disconnected: {e.Message}"));
                     }
                 }
             });
         }
+
+        #endregion
+
+        #region Quote/Trade Messages
 
         private void HandleQuoteMessage(string symbol, string message)
         {
@@ -254,11 +302,32 @@ namespace QuantConnect.Brokerages.TastyTrade
 
         private string GetQuoteStreamUrl(string symbol)
         {
-            var response = _client.GetAsync($"{_baseUrl}/api-quote-tokens").Result;
-            var content = response.Content.ReadAsStringAsync().Result;
-            var data = JObject.Parse(content);
+            try
+            {
+                var response = _client.GetAsync($"{_baseUrl}/api-quote-tokens").Result;
+                var content = response.Content.ReadAsStringAsync().Result;
 
-            return $"{data["websocket-url"]}/quote/{symbol}?token={data["token"]}";
+                if (!response.IsSuccessStatusCode)
+                {
+                    throw new Exception($"Failed to get streaming URL: {content}");
+                }
+
+                var data = JObject.Parse(content);
+                var wsUrl = data["data"]?["websocket-url"]?.ToString();
+                var token = data["data"]?["token"]?.ToString();
+
+                if (string.IsNullOrEmpty(wsUrl) || string.IsNullOrEmpty(token))
+                {
+                    throw new Exception("Missing websocket URL or token in response");
+                }
+
+                return $"{wsUrl}/quote/{symbol}?token={token}";
+            }
+            catch (Exception e)
+            {
+                Log.Error($"TastyTradeBrokerage.GetQuoteStreamUrl(): {e.Message}");
+                throw;
+            }
         }
 
         private string GetTradeStreamUrl(string symbol)
@@ -270,10 +339,7 @@ namespace QuantConnect.Brokerages.TastyTrade
             return $"{data["websocket-url"]}/trade/{symbol}?token={data["token"]}";
         }
 
-        private class SubscriptionData
-        {
-            public Symbol Symbol { get; set; }
-            public DateTimeZone ExchangeTimeZone { get; set; }
-        }
+        #endregion
+
     }
 }

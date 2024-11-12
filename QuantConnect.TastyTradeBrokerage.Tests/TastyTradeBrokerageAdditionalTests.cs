@@ -57,12 +57,12 @@ namespace QuantConnect.Brokerages.TastyTrade.Tests
     public class TestTastyTradeBrokerage : TastyTradeBrokerage
     {
         public TestTastyTradeBrokerage(string username, string password, string sessionToken, IAlgorithm algorithm)
-            : base(username, password, sessionToken, algorithm)
+            : base(username, password, true, "sandbox", algorithm)
         {
         }
 
         public TestTastyTradeBrokerage(string username, string password, string sessionToken, IOrderProvider orderProvider, ISecurityProvider securityProvider)
-            : base(username, password, sessionToken, orderProvider, securityProvider)
+            : base(username, password, null, null, "sandbox", true, orderProvider, securityProvider, true)
         {
         }
 

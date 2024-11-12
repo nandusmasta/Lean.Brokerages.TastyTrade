@@ -1,3 +1,4 @@
+using Moq;
 using NUnit.Framework;
 using QuantConnect.Interfaces;
 using QuantConnect.Logging;
@@ -9,6 +10,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
+using QuantConnect.Configuration;
 using static QuantConnect.Brokerages.TastyTrade.Tests.TastyTradeBrokerageAdditionalTests;
 
 namespace QuantConnect.Brokerages.TastyTrade.Tests
