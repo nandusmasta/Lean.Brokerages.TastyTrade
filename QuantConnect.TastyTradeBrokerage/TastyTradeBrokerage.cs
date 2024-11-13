@@ -40,22 +40,22 @@ namespace QuantConnect.Brokerages.TastyTrade
         private string _baseUrl;
         private string _sessionToken;
         private string _rememberToken;
+        private string _accountId;
+        private bool _isInitialized;
+        private bool _connected;
+
         private DateTime _sessionExpiration;
         private IHttpClient _client;
-        private TastyTradeSymbolMapper _symbolMapper;
-        private string _accountId;
-
         private IDataAggregator _aggregator;
         private IOrderProvider _orderProvider;
         private ISecurityProvider _securityProvider;
-        
+
+        private readonly TastyTradeOAuthHandler _authHandler;
         private readonly ConcurrentDictionary<string, TastyTradeWebSocketClient> _websocketClients = new();
+        private TastyTradeSymbolMapper _symbolMapper;
         private EventBasedDataQueueHandlerSubscriptionManager _subscriptionManager;
         private ConcurrentDictionary<int, decimal> _orderIdToFillQuantity;
         private BrokerageConcurrentMessageHandler<ITastyTradeOrderUpdate> _messageHandler;
-
-        private bool _isInitialized;
-        private bool _connected;
 
         public override bool IsConnected => _connected;
 
@@ -67,53 +67,60 @@ namespace QuantConnect.Brokerages.TastyTrade
             _orderIdToFillQuantity = new ConcurrentDictionary<int, decimal>();
         }
 
-        public TastyTradeBrokerage(string clientId, string clientSecret, string environment, bool paperTrading,
-            IAlgorithm algorithm)
-            : this(null, null, clientId, clientSecret, environment, paperTrading, algorithm?.Portfolio?.Transactions, algorithm?.Portfolio, true)
+        // OAuth constructor
+        public TastyTradeBrokerage(string clientId, string clientSecret, string accessToken, string refreshToken, string redirectUri, string environment,
+            bool paperTrading, IAlgorithm algorithm, bool useOAuth = true)
+            : this(clientId, clientSecret, accessToken, refreshToken, redirectUri, environment, paperTrading, algorithm?.Portfolio?.Transactions, 
+                  algorithm?.Portfolio, useOAuth)
         {
-            Log.Debug($"TastyTradeBrokerage Constructor 1: client id length: {clientId?.Length}, environment: {environment}");
         }
 
-        public TastyTradeBrokerage(string username, string password, bool paperTrading, string environment,
-            IAlgorithm algorithm)
-            : this(username, password, null, null, environment, paperTrading, algorithm?.Portfolio?.Transactions, algorithm?.Portfolio, false)
+        // Credentials constructor
+        public TastyTradeBrokerage(string username, string password, string environment, bool paperTrading, IAlgorithm algorithm)
+            : this(username, password, environment, paperTrading, algorithm?.Portfolio?.Transactions, algorithm?.Portfolio)
         {
-            Log.Debug($"TastyTradeBrokerage Constructor 1: username length: {username?.Length}, environment: {environment}");
         }
 
-        public TastyTradeBrokerage(string username, string password, string clientId, string clientSecret, string environment, bool paperTrading,
-            IOrderProvider orderProvider, ISecurityProvider securityProvider, bool useOAuth)
+        // OAuth private constructor
+        private TastyTradeBrokerage(string clientId, string clientSecret, string accessToken, string refreshToken, string redirectUri, string environment,
+            bool paperTrading, IOrderProvider orderProvider, ISecurityProvider securityProvider, bool useOAuth)
             : base("TastyTrade")
         {
-            Log.DebuggingEnabled = true;
-            Log.Debug($"TastyTradeBrokerage Constructor 2: username length: {username?.Length}, client id length: {clientId?.Length}, environment: {environment}");
-
-            if (string.IsNullOrWhiteSpace(username))
-            {
-                throw new ArgumentException("Username cannot be null or empty", nameof(username));
-            }
-            if (string.IsNullOrWhiteSpace(password))
-            {
-                throw new ArgumentException("Password cannot be null or empty", nameof(password));
-            }
-            if (string.IsNullOrWhiteSpace(environment))
-            {
-                throw new ArgumentException("Environment cannot be null or empty", nameof(environment));
-            }
-
-            _username = username;
-            _password = password;
-            _clientId = clientId;
-            _clientSecret = clientSecret;
             _useOAuth = useOAuth;
             _paperTrading = paperTrading;
 
-            if (_paperTrading)
+            var isSandbox = environment.ToLowerInvariant() == "sandbox";
+            _baseUrl = isSandbox ? "https://api.cert.tastyworks.com" : "https://api.tastyworks.com";
+
+            _client = new HttpClientWrapper();
+
+            if (_useOAuth)
             {
-                Log.Trace("TastyTradeBrokerage Constructor: Paper trading enabled - will switch to paper account after authentication");
+                _authHandler = new TastyTradeOAuthHandler(
+                    clientId, clientSecret, redirectUri, accessToken, refreshToken, isSandbox, _client);
             }
 
-            SetupBrokerage(environment, orderProvider, securityProvider);
+            Initialize(orderProvider, securityProvider);
+        }
+
+        // Credentials private constructor
+        private TastyTradeBrokerage(string username, string password, string environment, bool paperTrading, IOrderProvider orderProvider, ISecurityProvider securityProvider)
+            : base("TastyTrade")
+        {
+            _useOAuth = false;
+            _username = username;
+            _password = password;
+            _paperTrading = paperTrading;
+
+            _baseUrl = environment.ToLowerInvariant() switch
+            {
+                "sandbox" => "https://api.cert.tastyworks.com",
+                _ => "https://api.tastyworks.com"
+            };
+
+            _client = new HttpClientWrapper();
+
+            Initialize(orderProvider, securityProvider);
         }
 
         private void SetupBrokerage(string environment, IOrderProvider orderProvider, ISecurityProvider securityProvider)
@@ -135,8 +142,7 @@ namespace QuantConnect.Brokerages.TastyTrade
 
         #region Initialization
 
-        private void Initialize(string username, string password, string sessionToken,
-        IOrderProvider orderProvider, ISecurityProvider securityProvider)
+        private void Initialize(string username, string password, string sessionToken, IOrderProvider orderProvider, ISecurityProvider securityProvider)
         {
             if (_isInitialized)
             {
@@ -153,7 +159,7 @@ namespace QuantConnect.Brokerages.TastyTrade
             // Handle authentication
             if (string.IsNullOrEmpty(sessionToken))
             {
-                _sessionToken = AuthenticateWithCredentials(username, password).Result;
+                AuthenticateWithCredentials().RunSynchronously();
             }
             else
             {
@@ -165,6 +171,12 @@ namespace QuantConnect.Brokerages.TastyTrade
 
         private void Initialize(IOrderProvider orderProvider, ISecurityProvider securityProvider)
         {
+            if (_isInitialized)
+            {
+                return;
+            }
+            _isInitialized = true;
+
             _client = new HttpClientWrapper();
             _orderIdToFillQuantity = new ConcurrentDictionary<int, decimal>();
             _orderProvider = orderProvider;
@@ -173,7 +185,10 @@ namespace QuantConnect.Brokerages.TastyTrade
 
             // Authenticate and set up the session token
             _sessionToken = AuthenticateSession().Result;
-            _client.DefaultRequestHeaders.Add("Authorization", _sessionToken);
+
+            // Initialize default headers after authentication
+            _client.DefaultRequestHeaders.Clear();
+            _client.DefaultRequestHeaders.TryAddWithoutValidation("Authorization", _sessionToken);
 
             // Initialize message handler
             _messageHandler = new BrokerageConcurrentMessageHandler<ITastyTradeOrderUpdate>(HandleOrderUpdate);
@@ -282,50 +297,47 @@ namespace QuantConnect.Brokerages.TastyTrade
 
         #region Sesion Management
 
-        private async Task<HttpResponseMessage> AuthenticateWithOAuth()
-        {
-            var request = new HttpRequestMessage(HttpMethod.Post, $"{_baseUrl}/oauth/token")
-            {
-                Content = new FormUrlEncodedContent(new[]
-                {
-                new KeyValuePair<string, string>("client_id", _clientId),
-                new KeyValuePair<string, string>("client_secret", _clientSecret),
-                new KeyValuePair<string, string>("grant_type", "client_credentials")
-            })
-            };
-
-            return await _client.SendAsync(request);
-        }
-
-        private async Task<HttpResponseMessage> AuthenticateWithCredentials()
-        {
-            var request = new HttpRequestMessage(HttpMethod.Post, $"{_baseUrl}/sessions")
-            {
-                Content = new StringContent(
-                    JsonConvert.SerializeObject(new
-                    {
-                        login = _username,
-                        password = _password,
-                        remember_me = true
-                    }),
-                    Encoding.UTF8,
-                    "application/json")
-            };
-
-            return await _client.SendAsync(request);
-        }
-
-        private async Task<string> AuthenticateWithCredentials(string username, string password)
+        private async Task EnsureAuthenticated()
         {
             try
             {
+                if (_useOAuth)
+                {
+                    var authHeader = await _authHandler.GetAuthorizationHeader();
+                    _client.DefaultRequestHeaders.Remove("Authorization");
+                    _client.DefaultRequestHeaders.TryAddWithoutValidation("Authorization", authHeader);
+                }
+                else
+                {
+                    if (string.IsNullOrEmpty(_sessionToken) || DateTime.UtcNow >= _sessionExpiration)
+                    {
+                        await AuthenticateWithCredentials();
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                throw new BrokerageException($"Authentication failed: {e.Message}", e);
+            }
+        }
+
+        private async Task AuthenticateWithCredentials()
+        {
+            try
+            {
+                var authPayload = new
+                {
+                    login = _username,
+                    password = _password,
+                    remember_me = true
+                };
+
                 var request = new HttpRequestMessage(HttpMethod.Post, $"{_baseUrl}/sessions")
                 {
-                    Content = new StringContent(JsonConvert.SerializeObject(new
-                    {
-                        login = username,
-                        password = password
-                    }), Encoding.UTF8, "application/json")
+                    Content = new StringContent(
+                        JsonConvert.SerializeObject(authPayload),
+                        Encoding.UTF8,
+                        "application/json")
                 };
 
                 var response = await _client.SendAsync(request);
@@ -333,17 +345,35 @@ namespace QuantConnect.Brokerages.TastyTrade
 
                 if (!response.IsSuccessStatusCode)
                 {
-                    throw new Exception($"Authentication failed: {content}");
+                    throw new BrokerageException($"Error authenticating: {content}");
                 }
 
-                var result = JsonConvert.DeserializeObject<JObject>(content);
-                return result["session-token"].ToString();
+                var result = JObject.Parse(content);
+                var data = result["data"];
+
+                _sessionToken = data["session-token"].ToString();
+                if (DateTime.TryParse(data["session-expiration"]?.ToString(), out var expiration))
+                {
+                    _sessionExpiration = expiration;
+                }
+                else
+                {
+                    _sessionExpiration = DateTime.UtcNow.AddHours(24);
+                }
+
+                _client.DefaultRequestHeaders.Remove("Authorization");
+                _client.DefaultRequestHeaders.TryAddWithoutValidation("Authorization", _sessionToken);
             }
             catch (Exception e)
             {
-                Log.Error($"TastyTradeBrokerage.AuthenticateWithCredentials(): {e.Message}");
-                throw;
+                throw new BrokerageException($"Error during authentication: {e.Message}", e);
             }
+        }
+
+        private async Task<HttpResponseMessage> SendAuthenticatedRequest(HttpRequestMessage request)
+        {
+            await EnsureAuthenticated();
+            return await _client.SendAsync(request);
         }
 
         private async Task<string> AuthenticateSession()
@@ -368,36 +398,17 @@ namespace QuantConnect.Brokerages.TastyTrade
                 };
 
                 var jsonPayload = JsonConvert.SerializeObject(authPayload, Formatting.Indented);
-                Log.Debug($"TastyTradeBrokerage.AuthenticateSession(): Authentication URL: {_baseUrl}/sessions");
-                Log.Debug($"TastyTradeBrokerage.AuthenticateSession(): Authentication payload:\n{jsonPayload}");
+                Log.Trace($"TastyTradeBrokerage.AuthenticateSession(): Authentication URL: {_baseUrl}/sessions");
+                Log.Trace($"TastyTradeBrokerage.AuthenticateSession(): Authentication payload:\n{jsonPayload}");
 
                 var request = new HttpRequestMessage(HttpMethod.Post, $"{_baseUrl}/sessions")
                 {
                     Content = new StringContent(jsonPayload, Encoding.UTF8, "application/json")
                 };
 
-                // Log request headers
-                Log.Debug("TastyTradeBrokerage.AuthenticateSession(): Request Headers:");
-                foreach (var header in request.Headers)
-                {
-                    Log.Debug($"    {header.Key}: {string.Join(", ", header.Value)}");
-                }
-                foreach (var header in request.Content.Headers)
-                {
-                    Log.Debug($"    {header.Key}: {string.Join(", ", header.Value)}");
-                }
-
+                Log.Trace("TastyTradeBrokerage.AuthenticateSession(): Sending request...");
                 var response = await _client.SendAsync(request);
                 var content = await response.Content.ReadAsStringAsync();
-
-                // Log response details
-                Log.Debug($"TastyTradeBrokerage.AuthenticateSession(): Response Status: {response.StatusCode}");
-                Log.Debug($"TastyTradeBrokerage.AuthenticateSession(): Response Headers:");
-                foreach (var header in response.Headers)
-                {
-                    Log.Debug($"    {header.Key}: {string.Join(", ", header.Value)}");
-                }
-                Log.Debug($"TastyTradeBrokerage.AuthenticateSession(): Response Content:\n{content}");
 
                 if (!response.IsSuccessStatusCode)
                 {
@@ -413,12 +424,12 @@ namespace QuantConnect.Brokerages.TastyTrade
                 if (DateTime.TryParse(data["session-expiration"]?.ToString(), out var expiration))
                 {
                     _sessionExpiration = expiration;
-                    Log.Debug($"TastyTradeBrokerage.AuthenticateSession(): Session will expire at: {_sessionExpiration}");
+                    Log.Trace($"TastyTradeBrokerage.AuthenticateSession(): Session will expire at: {_sessionExpiration}");
                 }
                 else
                 {
                     _sessionExpiration = DateTime.UtcNow.AddHours(24);
-                    Log.Debug($"TastyTradeBrokerage.AuthenticateSession(): Using default expiration of 24 hours: {_sessionExpiration}");
+                    Log.Trace($"TastyTradeBrokerage.AuthenticateSession(): Using default expiration of 24 hours: {_sessionExpiration}");
                 }
 
                 if (string.IsNullOrEmpty(_sessionToken))
@@ -426,10 +437,11 @@ namespace QuantConnect.Brokerages.TastyTrade
                     throw new BrokerageException("Session token not found in response");
                 }
 
-                Log.Debug($"TastyTradeBrokerage.AuthenticateSession(): Successfully authenticated with token length: {_sessionToken.Length}");
+                Log.Trace($"TastyTradeBrokerage.AuthenticateSession(): Successfully authenticated with token length: {_sessionToken.Length}");
 
+                // Clear and set the Authorization header
                 _client.DefaultRequestHeaders.Remove("Authorization");
-                _client.DefaultRequestHeaders.Add("Authorization", _sessionToken);
+                _client.DefaultRequestHeaders.TryAddWithoutValidation("Authorization", _sessionToken);
 
                 if (_paperTrading)
                 {
@@ -452,12 +464,6 @@ namespace QuantConnect.Brokerages.TastyTrade
             {
                 await AuthenticateSession();
             }
-        }
-
-        private async Task<HttpResponseMessage> SendAuthenticatedRequest(HttpRequestMessage request)
-        {
-            await EnsureValidSession();
-            return await _client.SendAsync(request);
         }
 
         public override void Dispose()
@@ -497,6 +503,216 @@ namespace QuantConnect.Brokerages.TastyTrade
             _cancellationTokenSource?.Dispose();
 
             base.Dispose();
+        }
+
+        public override void Connect()
+        {
+            if (_connected) return;
+
+            try
+            {
+                // Initialize account details first
+                _accountId = GetAccountId();
+
+                // Initialize WebSocket connections
+                var quoteSocket = new TastyTradeWebSocketClient(GetQuoteStreamUrl(_accountId), _sessionToken, SecurityType.Equity);
+                var tradeSocket = new TastyTradeWebSocketClient(GetTradeStreamUrl(_accountId), _sessionToken, SecurityType.Equity);
+
+                // Set up message handlers
+                quoteSocket.MessageReceived += (msg) => HandleQuoteMessage(msg);
+                tradeSocket.MessageReceived += (msg) => HandleTradeMessage(msg);
+
+                // Set up error handlers
+                quoteSocket.Error += (ex) => OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Error, -1, $"Quote socket error: {ex.Message}"));
+                tradeSocket.Error += (ex) => OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Error, -1, $"Trade socket error: {ex.Message}"));
+
+                // Connect sockets
+                quoteSocket.Connect().Wait();
+                tradeSocket.Connect().Wait();
+
+                // Store socket clients
+                _websocketClients["quote"] = quoteSocket;
+                _websocketClients["trade"] = tradeSocket;
+
+                _connected = true;
+                OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Reconnect, -1, "Connected successfully to TastyTrade"));
+            }
+            catch (Exception e)
+            {
+                Log.Error($"TastyTradeBrokerage.Connect(): Error connecting: {e.Message}");
+                _connected = false;
+                OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Error, -1, $"Error connecting to TastyTrade: {e.Message}"));
+                throw;
+            }
+        }
+
+        public override async void Disconnect()
+        {
+            if (!_connected) return;
+
+            try
+            {
+                // Destroy the session if we have a token
+                if (!string.IsNullOrEmpty(_sessionToken))
+                {
+                    var request = new HttpRequestMessage(HttpMethod.Delete, $"{_baseUrl}/sessions")
+                    {
+                        Headers = { { "Authorization", _sessionToken } }
+                    };
+
+                    await _client.SendAsync(request);
+                }
+
+                _sessionToken = null;
+                _rememberToken = null;
+                _connected = false;
+
+                // Cleanup WebSocket connections
+                foreach (var client in _websocketClients.Values)
+                {
+                    try
+                    {
+                        client.Disconnect().Wait(TimeSpan.FromSeconds(2));
+                        client.Dispose();
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Error($"TastyTradeBrokerage.Disconnect(): Error disconnecting WebSocket client: {ex.Message}");
+                    }
+                }
+
+                _websocketClients.Clear();
+                OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Disconnect, -1, "Disconnected from TastyTrade"));
+            }
+            catch (Exception e)
+            {
+                Log.Error($"TastyTradeBrokerage.Disconnect(): Error during disconnect: {e.Message}");
+            }
+        }
+
+        private string GetAccountId()
+        {
+            try
+            {
+                if (!string.IsNullOrEmpty(_accountId))
+                {
+                    return _accountId;
+                }
+
+                Log.Trace("TastyTradeBrokerage.GetAccountId(): Requesting account information...");
+
+                // Log the request details
+                var accountsUrl = $"{_baseUrl}/customers/me/accounts";
+                Log.Trace($"TastyTradeBrokerage.GetAccountId(): Request URL: {accountsUrl}");
+                Log.Trace("TastyTradeBrokerage.GetAccountId(): Request Headers:");
+                foreach (var header in _client.DefaultRequestHeaders)
+                {
+                    Log.Trace($"  {header.Key}: {string.Join(", ", header.Value)}");
+                }
+
+                var response = _client.GetAsync(accountsUrl).Result;
+                var content = response.Content.ReadAsStringAsync().Result;
+
+                Log.Trace($"TastyTradeBrokerage.GetAccountId(): Response Status: {response.StatusCode}");
+                Log.Trace($"TastyTradeBrokerage.GetAccountId(): Response Headers:");
+                foreach (var header in response.Headers)
+                {
+                    Log.Trace($"  {header.Key}: {string.Join(", ", header.Value)}");
+                }
+                Log.Trace($"TastyTradeBrokerage.GetAccountId(): Response Content: {content}");
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    throw new BrokerageException($"Error getting account information: {content}");
+                }
+
+                if (string.IsNullOrWhiteSpace(content))
+                {
+                    Log.Error("TastyTradeBrokerage.GetAccountId(): Empty response content");
+                    throw new BrokerageException("Empty response from accounts endpoint");
+                }
+
+                var accounts = JObject.Parse(content);
+
+                // Log the parsed structure
+                Log.Trace($"TastyTradeBrokerage.GetAccountId(): Parsed JSON structure:");
+                foreach (var prop in accounts.Properties())
+                {
+                    Log.Trace($"  {prop.Name}: {prop.Value?.Type}");
+                }
+
+                var items = accounts["data"]?["items"];
+
+                if (items == null)
+                {
+                    Log.Error("TastyTradeBrokerage.GetAccountId(): No 'data.items' found in response");
+                    Log.Error($"TastyTradeBrokerage.GetAccountId(): Available paths in response:");
+                    LogJTokenPaths(accounts);
+                    throw new BrokerageException("Invalid response structure - missing data.items");
+                }
+
+                if (!items.Any())
+                {
+                    Log.Error("TastyTradeBrokerage.GetAccountId(): No accounts found in response");
+                    throw new BrokerageException("No accounts found in response");
+                }
+
+                // Log all available accounts for debugging
+                Log.Trace("TastyTradeBrokerage.GetAccountId(): Available accounts:");
+                foreach (var account in items)
+                {
+                    Log.Trace($"  Account Number: {account["account-number"]}");
+                    Log.Trace($"  Type: {account["account-type-name"]}");
+                    Log.Trace($"  Is Test Drive: {account["is-test-drive"]}");
+                    Log.Trace($"  Is Closed: {account["is-closed"]}");
+                    Log.Trace($"  Status: {account["status"]}");
+                    // Log all properties of the account
+                    Log.Trace("  All Properties:");
+                    foreach (var prop in account.Children<JProperty>())
+                    {
+                        Log.Trace($"    {prop.Name}: {prop.Value}");
+                    }
+                }
+
+                // Rest of your existing account selection logic...
+                // First try to find a paper trading account if paper trading is enabled
+                if (_paperTrading)
+                {
+                    var demoAccount = items.FirstOrDefault(a =>
+                        a["is-test-drive"]?.Value<bool>() == true ||
+                        (a["account-type-name"]?.ToString().Contains("Simulation", StringComparison.OrdinalIgnoreCase) ?? false) ||
+                        (a["account-type-name"]?.ToString().Contains("Demo", StringComparison.OrdinalIgnoreCase) ?? false));
+
+                    if (demoAccount != null)
+                    {
+                        _accountId = demoAccount["account-number"].ToString();
+                        Log.Trace($"TastyTradeBrokerage.GetAccountId(): Found paper trading account: {_accountId}");
+                        return _accountId;
+                    }
+                }
+
+                // Look for any active trading account
+                var tradingAccount = items.FirstOrDefault(a =>
+                    a["status"]?.ToString().Equals("Active", StringComparison.OrdinalIgnoreCase) == true &&
+                    a["is-closed"]?.Value<bool>() == false);
+
+                if (tradingAccount == null)
+                {
+                    Log.Error("TastyTradeBrokerage.GetAccountId(): No active trading account found");
+                    throw new BrokerageException("No active trading account found");
+                }
+
+                _accountId = tradingAccount["account-number"].ToString();
+                Log.Trace($"TastyTradeBrokerage.GetAccountId(): Using active trading account: {_accountId}");
+
+                return _accountId;
+            }
+            catch (Exception e)
+            {
+                var message = $"Error retrieving account ID: {e.Message}";
+                Log.Error($"TastyTradeBrokerage.GetAccountId(): {message}");
+                throw new BrokerageException(message, e);
+            }
         }
 
         #endregion
@@ -681,134 +897,27 @@ namespace QuantConnect.Brokerages.TastyTrade
             }
         }
 
-        public override void Connect()
+        private void LogJTokenPaths(JToken token, string path = "")
         {
-            if (_connected) return;
-
-            try
+            switch (token.Type)
             {
-                // Initialize account details first
-                _accountId = GetAccountId();
-
-                // Initialize WebSocket connections
-                var quoteSocket = new TastyTradeWebSocketClient(GetQuoteStreamUrl(_accountId), _sessionToken, SecurityType.Equity);
-                var tradeSocket = new TastyTradeWebSocketClient(GetTradeStreamUrl(_accountId), _sessionToken, SecurityType.Equity);
-
-                // Set up message handlers
-                quoteSocket.MessageReceived += (msg) => HandleQuoteMessage(msg);
-                tradeSocket.MessageReceived += (msg) => HandleTradeMessage(msg);
-
-                // Set up error handlers
-                quoteSocket.Error += (ex) => OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Error, -1, $"Quote socket error: {ex.Message}"));
-                tradeSocket.Error += (ex) => OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Error, -1, $"Trade socket error: {ex.Message}"));
-
-                // Connect sockets
-                quoteSocket.Connect().Wait();
-                tradeSocket.Connect().Wait();
-
-                // Store socket clients
-                _websocketClients["quote"] = quoteSocket;
-                _websocketClients["trade"] = tradeSocket;
-
-                _connected = true;
-                OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Reconnect, -1, "Connected successfully to TastyTrade"));
-            }
-            catch (Exception e)
-            {
-                Log.Error($"TastyTradeBrokerage.Connect(): Error connecting: {e.Message}");
-                _connected = false;
-                OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Error, -1, $"Error connecting to TastyTrade: {e.Message}"));
-                throw;
-            }
-        }
-
-        public override async void Disconnect()
-        {
-            if (!_connected) return;
-
-            try
-            {
-                // Destroy the session if we have a token
-                if (!string.IsNullOrEmpty(_sessionToken))
-                {
-                    var request = new HttpRequestMessage(HttpMethod.Delete, $"{_baseUrl}/sessions")
+                case JTokenType.Object:
+                    foreach (var prop in (token as JObject).Properties())
                     {
-                        Headers = { { "Authorization", _sessionToken } }
-                    };
-
-                    await _client.SendAsync(request);
-                }
-
-                _sessionToken = null;
-                _rememberToken = null;
-                _connected = false;
-
-                // Cleanup WebSocket connections
-                foreach (var client in _websocketClients.Values)
-                {
-                    try
-                    {
-                        client.Disconnect().Wait(TimeSpan.FromSeconds(2));
-                        client.Dispose();
+                        var newPath = string.IsNullOrEmpty(path) ? prop.Name : $"{path}.{prop.Name}";
+                        Log.Trace($"  {newPath}: {prop.Value?.Type}");
+                        LogJTokenPaths(prop.Value, newPath);
                     }
-                    catch (Exception ex)
+                    break;
+
+                case JTokenType.Array:
+                    if (token.HasValues)
                     {
-                        Log.Error($"TastyTradeBrokerage.Disconnect(): Error disconnecting WebSocket client: {ex.Message}");
+                        var array = token as JArray;
+                        Log.Trace($"  {path}: Array[{array.Count}]");
+                        LogJTokenPaths(array.First, $"{path}[0]");
                     }
-                }
-
-                _websocketClients.Clear();
-                OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Disconnect, -1, "Disconnected from TastyTrade"));
-            }
-            catch (Exception e)
-            {
-                Log.Error($"TastyTradeBrokerage.Disconnect(): Error during disconnect: {e.Message}");
-            }
-        }
-
-        private string GetAccountId()
-        {
-            if (!string.IsNullOrEmpty(_accountId))
-            {
-                return _accountId;
-            }
-
-            try
-            {
-                var response = _client.GetAsync($"{_baseUrl}/customers/me/accounts").Result;
-                var content = response.Content.ReadAsStringAsync().Result;
-
-                if (!response.IsSuccessStatusCode)
-                {
-                    throw new BrokerageException($"Error getting account information: {content}");
-                }
-
-                var accounts = JObject.Parse(content);
-
-                // Get the first active trading account
-                var tradingAccount = accounts["data"]["items"]
-                    .FirstOrDefault(a => a["type"].ToString() == "trading" &&
-                                       a["status"].ToString() == "active");
-
-                if (tradingAccount == null)
-                {
-                    throw new BrokerageException("No active trading account found");
-                }
-
-                _accountId = tradingAccount["account-number"].ToString();
-
-                if (string.IsNullOrEmpty(_accountId))
-                {
-                    throw new BrokerageException("Account number not found in response");
-                }
-
-                return _accountId;
-            }
-            catch (Exception e)
-            {
-                var message = $"Error retrieving account ID: {e.Message}";
-                Log.Error($"TastyTradeBrokerage.GetAccountId(): {message}");
-                throw new BrokerageException(message, e);
+                    break;
             }
         }
 
