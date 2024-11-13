@@ -21,7 +21,7 @@ namespace QuantConnect.Brokerages.TastyTrade.Tests
         public void OneTimeSetUp()
         {
             var (username, password, sessionToken) = TastyTradeBrokerageTestHelpers.GetConfigParameters();
-            _tastyTradeBrokerage = new TastyTradeBrokerage(username, password, true, "sandbox", new Mock<IAlgorithm>().Object);
+            _tastyTradeBrokerage = new TastyTradeBrokerage(username, password, "sandbox", true, new Mock<IAlgorithm>().Object);
         }
 
         private static IEnumerable<TestCaseData> TestParameters

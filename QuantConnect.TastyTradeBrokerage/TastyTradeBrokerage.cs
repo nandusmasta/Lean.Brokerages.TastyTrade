@@ -104,7 +104,7 @@ namespace QuantConnect.Brokerages.TastyTrade
         }
 
         // Credentials private constructor
-        private TastyTradeBrokerage(string username, string password, string environment, bool paperTrading, IOrderProvider orderProvider, ISecurityProvider securityProvider)
+        public TastyTradeBrokerage(string username, string password, string environment, bool paperTrading, IOrderProvider orderProvider, ISecurityProvider securityProvider)
             : base("TastyTrade")
         {
             _useOAuth = false;
