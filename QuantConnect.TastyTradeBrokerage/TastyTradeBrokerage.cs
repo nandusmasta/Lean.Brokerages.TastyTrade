@@ -31,8 +31,6 @@ namespace QuantConnect.Brokerages.TastyTrade
         private const string PRODUCTION_API_URL = "https://api.tastyworks.com";
         private const string SANDBOX_API_URL = "https://api.cert.tastyworks.com";
 
-        private readonly string _clientId;
-        private readonly string _clientSecret;
         private readonly string _username;
         private readonly string _password;
         private readonly bool _paperTrading;
@@ -48,7 +46,6 @@ namespace QuantConnect.Brokerages.TastyTrade
         private IHttpClient _client;
         private IDataAggregator _aggregator;
         private IOrderProvider _orderProvider;
-        private ISecurityProvider _securityProvider;
 
         private readonly TastyTradeOAuthHandler _authHandler;
         private readonly ConcurrentDictionary<string, TastyTradeWebSocketClient> _websocketClients = new();
@@ -92,8 +89,6 @@ namespace QuantConnect.Brokerages.TastyTrade
             var isSandbox = environment.ToLowerInvariant() == "sandbox";
             _baseUrl = isSandbox ? "https://api.cert.tastyworks.com" : "https://api.tastyworks.com";
 
-            _client = new HttpClientWrapper();
-
             if (_useOAuth)
             {
                 _authHandler = new TastyTradeOAuthHandler(
@@ -117,8 +112,6 @@ namespace QuantConnect.Brokerages.TastyTrade
                 "sandbox" => "https://api.cert.tastyworks.com",
                 _ => "https://api.tastyworks.com"
             };
-
-            _client = new HttpClientWrapper();
 
             Initialize(orderProvider, securityProvider);
         }
@@ -153,7 +146,6 @@ namespace QuantConnect.Brokerages.TastyTrade
             _client = new HttpClientWrapper();
             _orderIdToFillQuantity = new ConcurrentDictionary<int, decimal>();
             _orderProvider = orderProvider;
-            _securityProvider = securityProvider;
             _symbolMapper = new TastyTradeSymbolMapper();
 
             // Handle authentication
@@ -180,7 +172,6 @@ namespace QuantConnect.Brokerages.TastyTrade
             _client = new HttpClientWrapper();
             _orderIdToFillQuantity = new ConcurrentDictionary<int, decimal>();
             _orderProvider = orderProvider;
-            _securityProvider = securityProvider;
             _symbolMapper = new TastyTradeSymbolMapper();
 
             // Authenticate and set up the session token
@@ -468,39 +459,18 @@ namespace QuantConnect.Brokerages.TastyTrade
 
         public override void Dispose()
         {
-            // Cancel any pending operations
-            _cancellationTokenSource?.Cancel();
-
-            // Cleanup WebSockets
-            foreach (var sockets in _webSocketsBySymbol.Values)
+            foreach (var webSocket in _webSockets.Values)
             {
-                foreach (var socket in sockets)
+                try
                 {
-                    try
-                    {
-                        if (socket != null)
-                        {
-                            if (socket.State == WebSocketState.Open)
-                            {
-                                socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Disposing",
-                                    CancellationToken.None).Wait(TimeSpan.FromSeconds(1));
-                            }
-                            socket.Dispose();
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        Log.Error($"TastyTradeBrokerage.Dispose(): Error disposing WebSocket: {ex.Message}");
-                    }
+                    webSocket?.Close();
+                }
+                catch (Exception e)
+                {
+                    Log.Error($"TastyTradeBrokerage.Dispose(): Error disposing WebSocket: {e.Message}");
                 }
             }
-            _webSocketsBySymbol.Clear();
-
-            // Cleanup other resources
-            _client?.Dispose();
-            _aggregator?.Dispose();
-            _messageHandler = null; // Simply null out the message handler
-            _cancellationTokenSource?.Dispose();
+            _webSockets.Clear();
 
             base.Dispose();
         }

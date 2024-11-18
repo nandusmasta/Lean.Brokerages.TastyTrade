@@ -5,8 +5,8 @@
   "api-access-token": "",
   "job-organization-id": "",
 
-  "tastytrade-client-id": "b40c52f9-00ba-484a-a850-2fc3611f6ed6",
-  "tastytrade-client-secret": "6695d0b53aa54faae83c4dcf7766d86aee2a1f02",
-  "tastytrade-environment": "sandbox",
-  "tastytrade-paper-trading": true
+  "tastytrade-client-id": "",
+  "tastytrade-client-secret": "",
+  "tastytrade-environment": "",
+  "tastytrade-paper-trading": false
 }

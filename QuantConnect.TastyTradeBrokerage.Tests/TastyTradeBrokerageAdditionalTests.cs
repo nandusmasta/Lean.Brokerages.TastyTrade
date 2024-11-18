@@ -6,7 +6,6 @@ using QuantConnect.Tests;
 using QuantConnect.Interfaces;
 using System.Collections.Generic;
 using QuantConnect.Securities;
-using Alpaca.Markets;
 
 namespace QuantConnect.Brokerages.TastyTrade.Tests
 {
